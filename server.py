@@ -1,6 +1,7 @@
 import socket
 import sqlite3
 import os
+import select
 
 
 class server:
@@ -10,10 +11,17 @@ class server:
         self.imports_table_name = imports_table_name
         self.users_table_name = users_table_name
         self.files_path = files_path
+        self.open_client_sockets = []
+        self.messages_to_send = []
 
-    def send_msg(self, msg, client_socket):
-        msg = msg.encode()
-        client_socket.send(msg)
+    # send messages
+    def send_waiting_messages(self, wlist, messages_to_send):
+        for message in messages_to_send:
+            (client_socket, data) = message
+            if client_socket in wlist:
+                data = data.encode()
+                client_socket.send(data)
+                messages_to_send.remove(message)
 
     # create data base table
     def create_table(self, table_path, table_name, column1, column2):
@@ -75,7 +83,7 @@ class server:
             self.insert(self.imports_table_name, column1, column2, data)
 
     # find the word in the data base
-    def find_word(self, the_word, client_socket):
+    def find_word(self, the_word, current_socket):
         conn = sqlite3.connect(self.data_base_path)
         cursor = conn.execute("SELECT * from {}".format(self.imports_table_name))
         names_lst = []
@@ -85,11 +93,13 @@ class server:
                 if word == row[0]:
                     names_lst.append(row[1])
         if len(names_lst) == 0:
-            self.send_msg("no results", client_socket)
+            self.messages_to_send.append((current_socket, "no results"))
         else:
-            names_lst = str(names_lst)
-            names_lst = names_lst[1:-1]
-            self.send_msg(names_lst, client_socket)
+            str_names_lst = ""
+            for i in names_lst:
+                str_names_lst += i + ", "
+            str_names_lst = str_names_lst[:-2]
+            self.messages_to_send.append((current_socket, str_names_lst))
 
     # find the user name and the password from the message
     def cut_sign_msg(self, msg):
@@ -110,71 +120,85 @@ class server:
         return exist
 
     # sign up an user
-    def sing_up(self, column1, column2, the_word, client_socket):
+    def sing_up(self, column1, column2, the_word, current_socket):
         profile = self.cut_sign_msg(the_word)
         exist = self.in_table(profile)
         if exist:
-            self.send_msg("This user is already exists", client_socket)
+            self.messages_to_send.append((current_socket, "This user is already exists"))
         else:
             self.insert(self.users_table_name, column1, column2, profile)
-            self.send_msg("You signed up", client_socket)
+            self.messages_to_send.append((current_socket, "You signed up"))
 
     # sign in an user
-    def sign_in(self, the_word, client_socket):
+    def sign_in(self, the_word, current_socket):
         profile = self.cut_sign_msg(the_word)
         exist = self.in_table(profile)
         if exist:
-            self.send_msg("You signed in", client_socket)
+            self.messages_to_send.append((current_socket, "You signed in"))
         else:
-            self.send_msg("You have a mistake in your user name or your password", client_socket)
+            self.messages_to_send.append((current_socket, "You have a mistake in your user name or your password"))
 
     def main(self):
         print("server begin")
         server_socket = socket.socket()
         server_socket.bind(("0.0.0.0", 8820))
         server_socket.listen(1)
-        (client_socket, client_address) = server_socket.accept()
         imports_column1 = 'the_import'
         imports_column2 = 'the_file'
         users_column1 = 'user_name'
         users_column2 = 'password'
 
         while True:
-            # get the word
-            the_word = client_socket.recv(1024)
-            the_word = the_word.decode()
-            if the_word == 'quit':
-                server_socket.close()
-                break
-            elif the_word == "create_imports_db":
-                try:
-                    self.create_table(self.data_base_path, self.imports_table_name, imports_column1, imports_column2)
-                    self.insert_imports(imports_column1, imports_column2)
-                    self.send_msg("Imports data base created", client_socket)
-                except:
-                    self.send_msg("There is data base already", client_socket)
-            elif "sign_up" in the_word:
-                try:
-                    self.sing_up(users_column1, users_column2, the_word, client_socket)
-                except:
-                    self.create_table(self.data_base_path, self.users_table_name, users_column1, users_column2)
-                    print("Users data base created")
-                    self.sing_up(users_column1, users_column2, the_word, client_socket)
-            elif "sign_in" in the_word:
-                try:
-                    self.sign_in(the_word, client_socket)
-                except:
-                    self.create_table(self.data_base_path, self.users_table_name, users_column1, users_column2)
-                    print("Users data base created")
-                    self.sign_in(the_word, client_socket)
-            else:
-                try:
-                    self.find_word(the_word, client_socket)
-                except:
-                    self.create_table(self.data_base_path, self.imports_table_name, imports_column1, imports_column2)
-                    self.insert_imports(imports_column1, imports_column2)
-                    print("Imports data base created")
-                    self.find_word(the_word, client_socket)
+            rlist, wlist, xlist = \
+                select.select([server_socket] + self.open_client_sockets, self.open_client_sockets, [])
+            for current_socket in rlist:
+                if current_socket is server_socket:
+                    (new_socket, address) = server_socket.accept()
+                    self.open_client_sockets.append(new_socket)
+                else:
+                    # get the word
+                    the_word = current_socket.recv(1024)
+                    the_word = the_word.decode()
+                    if the_word == 'quit':
+                        self.open_client_sockets.remove(current_socket)
+                        self.messages_to_send.append((current_socket, "end connection"))
+                    elif "sign_up" in the_word:
+                        try:
+                            self.sing_up(users_column1, users_column2, the_word, current_socket)
+                        except:
+                            self.create_table(self.data_base_path, self.users_table_name, users_column1, users_column2)
+                            print("Users data base created")
+                            self.sing_up(users_column1, users_column2, the_word, current_socket)
+                    elif "sign_in" in the_word:
+                        try:
+                            self.sign_in(the_word, current_socket)
+                        except:
+                            self.create_table(self.data_base_path, self.users_table_name, users_column1, users_column2)
+                            print("Users data base created")
+                            self.sign_in(the_word, current_socket)
+                    elif "file_len" in the_word:
+                        (command, file_name) = the_word.split(": ")
+                        file = open(self.files_path + "\\" + file_name)
+                        text = file.read()
+                        length = len(text)
+                        times = (length//1024)+1
+                        times = str(times)
+                        self.messages_to_send.append((current_socket, times))
+                    elif "send_file" in the_word:
+                        (command, file_name) = the_word.split(": ")
+                        file = open(self.files_path + "\\" + file_name)
+                        text = file.read()
+                        self.messages_to_send.append((current_socket, text))
+                    else:
+                        try:
+                            self.find_word(the_word, current_socket)
+                        except:
+                            self.create_table(self.data_base_path, self.imports_table_name, imports_column1,
+                                              imports_column2)
+                            self.insert_imports(imports_column1, imports_column2)
+                            print("Imports data base created")
+                            self.find_word(the_word, current_socket)
+            self.send_waiting_messages(wlist, self.messages_to_send)
 
 
 data_base_path = 'data_base.db'
